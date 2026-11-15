@@ -1,0 +1,402 @@
+import os
+import json
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+import httpx
+from pypdf import PdfReader
+
+from brain_app.database import get_db_connection
+from brain_app.rag.chunker import chunk_text
+from brain_app.rag.embeddings import embedding_service, EmbeddingError, GEMINI_BASE
+from brain_app.rag.model_catalog import DEFAULT_GEMINI_CHAT_MODEL
+from brain_app.rag.vector_store import vector_store
+
+
+class RAGService:
+    def __init__(self):
+        self.last_embedding_error = ""
+        self._init_api_key()
+
+    def _init_api_key(self):
+        """Embedding settings are read on demand by embedding_service; nothing to do."""
+        embedding_service.reload()
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        conn.close()
+        return row["value"] if row else default
+
+    @staticmethod
+    def _retrieval_text(question: str, chat_history: Optional[List[Dict[str, str]]]) -> str:
+        """For short follow-up questions, add the previous user question so retrieval has context."""
+        q = (question or "").strip()
+        if not chat_history or len(q.split()) > 8:
+            return q
+        prev = [m.get("content", "") for m in chat_history if m.get("role") == "user"]
+        prev = [p for p in prev if p.strip() and p.strip() != q]
+        return f"{prev[-1][:300]} {q}".strip() if prev else q
+
+    async def _embed_chunk_texts(self, texts: List[str]):
+        """Returns (vectors, tag). On failure vectors are empty -> chunks are stored as 'pending'."""
+        try:
+            vecs = await embedding_service.embed_documents(texts)
+            return vecs, embedding_service.active_tag()
+        except EmbeddingError as e:
+            print(f"[RAG] Embedding failed, chunks stored as pending: {e}")
+            self.last_embedding_error = str(e)
+            return [[] for _ in texts], ""
+
+    async def index_note(self, note_id: int, title: str, content: str, category: str = "", tags: List[str] = None):
+        """Re-chunks and re-indexes a single note."""
+        vector_store.delete_by_source("note", note_id)
+
+        full_text = f"# {title}\n\nCategory: {category}\nTags: {', '.join(tags or [])}\n\n{content}"
+        chunks = chunk_text(full_text)
+
+        now = datetime.utcnow().isoformat()
+        vecs, tag = await self._embed_chunk_texts([c["content"] for c in chunks])
+        records = []
+        for idx, c in enumerate(chunks):
+            emb = vecs[idx]
+            records.append({
+                "source_type": "note",
+                "source_id": note_id,
+                "source_title": title,
+                "chunk_index": idx,
+                "content": c["content"],
+                "embedding": emb,
+                "embedding_model": tag,
+                "metadata": {
+                    "category": category,
+                    "tags": tags or [],
+                    "header": c.get("header", "")
+                },
+                "created_at": now
+            })
+
+        vector_store.add_chunks(records)
+
+    async def index_document(self, doc_id: int, file_path: str, filename: str, file_type: str) -> Dict[str, Any]:
+        """Extracts text from PDF/TXT/MD, chunks, embeds, and updates document record."""
+        vector_store.delete_by_source("document", doc_id)
+
+        extracted_text = ""
+        try:
+            if file_type.lower() == "pdf":
+                reader = PdfReader(file_path)
+                pages = []
+                for i, page in enumerate(reader.pages):
+                    t = page.extract_text()
+                    if t:
+                        pages.append(f"--- Trang {i+1} ---\n" + t)
+                extracted_text = "\n\n".join(pages)
+            else:
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    extracted_text = f.read()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+        if not extracted_text.strip():
+            return {"success": False, "error": "Tập tin không chứa văn bản trích xuất được"}
+
+        chunks = chunk_text(extracted_text, chunk_size=800, overlap=120)
+        now = datetime.utcnow().isoformat()
+        vecs, tag = await self._embed_chunk_texts([c["content"] for c in chunks])
+        embedding_pending = not tag
+        records = []
+        for idx, c in enumerate(chunks):
+            emb = vecs[idx]
+            records.append({
+                "source_type": "document",
+                "source_id": doc_id,
+                "source_title": filename,
+                "chunk_index": idx,
+                "content": c["content"],
+                "embedding": emb,
+                "embedding_model": tag,
+                "metadata": {
+                    "file_type": file_type,
+                    "header": c.get("header", "")
+                },
+                "created_at": now
+            })
+
+        vector_store.add_chunks(records)
+
+        # Update document chunk count & summary
+        summary = extracted_text[:300].strip().replace("\n", " ") + "..."
+        if embedding_pending:
+            summary = "⚠ Chưa tạo embedding (xem Cài đặt → Embedding). " + summary
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE documents 
+            SET chunk_count = ?, summary = ?, status = 'indexed'
+            WHERE id = ?
+        """, (len(chunks), summary, doc_id))
+        conn.commit()
+        conn.close()
+
+        return {"success": True, "chunk_count": len(chunks), "embedding_pending": embedding_pending,
+                "embedding_error": self.last_embedding_error if embedding_pending else ""}
+
+    async def answer_query(
+        self,
+        question: str,
+        chat_history: Optional[List[Dict[str, str]]] = None,
+        top_k: int = 8,
+        provider: Optional[str] = None,
+        model: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Main RAG pipeline:
+        1. Embed question
+        2. Retrieve relevant chunks from Second Brain
+        3. Synthesize answer with selected LLM (Gemini or OpenRouter) or local fallback
+        """
+        # Retrieval text: short follow-ups ("còn bước 2 thì sao?") are meaningless alone, so prepend
+        # the previous user question(s) from the chat history for retrieval only.
+        retrieval_text = self._retrieval_text(question, chat_history)
+
+        # Embed (semantic) + keyword (FTS5), fused. If embedding fails, fall back to keyword-only
+        # and tell the user why instead of silently degrading.
+        tag = embedding_service.active_tag()
+        q_emb = None
+        embed_warning = ""
+        try:
+            q_emb = await embedding_service.embed_query(retrieval_text)
+        except EmbeddingError as e:
+            embed_warning = str(e)
+
+        chunks = vector_store.hybrid_search(retrieval_text, q_emb, model_tag=tag, top_k=top_k)
+
+        if embed_warning and not chunks:
+            return {
+                "answer": (
+                    "### ⚠️ Không thể tìm kiếm trong Second Brain\n\n"
+                    f"{embed_warning}\n\n"
+                    "👉 Mở **Cài đặt → Embedding** để kiểm tra cấu hình."
+                ),
+                "sources": []
+            }
+
+        stale_note = ""
+        if embed_warning:
+            stale_note = (f"> ⚠️ Embedding đang lỗi nên mình tìm theo **từ khóa**, kết quả có thể thiếu: "
+                          f"{embed_warning}\n\n")
+        elif not chunks:
+            st = vector_store.stats(tag)
+            if st["stale"] > 0:
+                stale_note = (
+                    f"> ⚠️ Có {st['stale']} đoạn kiến thức chưa được index bằng embedding hiện tại "
+                    f"(`{tag}`). Vào **Cài đặt → Embedding → Index lại** để tìm kiếm đầy đủ.\n\n"
+                )
+
+        # Build context
+        context_parts = []
+        sources = []
+        for i, c in enumerate(chunks):
+            src_info = {
+                "source_type": c["source_type"],
+                "source_id": c["source_id"],
+                "title": c["source_title"],
+                "score": c["score"],
+                "match": c.get("match", "semantic"),
+                "snippet": c["content"][:200] + ("..." if len(c["content"]) > 200 else "")
+            }
+            sources.append(src_info)
+            context_parts.append(
+                f"[Tài liệu {i+1}: {c['source_title']} ({'Ghi chú' if c['source_type'] == 'note' else 'Tài liệu'})]\n{c['content']}"
+            )
+
+        context_str = "\n\n".join(context_parts)
+
+        # Determine active provider & model
+        active_provider = (provider or self.get_setting("llm_provider", "gemini")).lower()
+
+        if active_provider == "openrouter":
+            or_key = self.get_setting("openrouter_api_key", os.getenv("OPENROUTER_API_KEY", ""))
+            or_model = model or self.get_setting("openrouter_model", "deepseek/deepseek-chat")
+            if or_key and len(or_key) > 5:
+                answer = await self._call_openrouter_rag(or_key, or_model, question, context_str, chat_history)
+            else:
+                answer = (
+                    "### ⚠️ Chưa cấu hình OpenRouter API Key\n\n"
+                    "Bạn đang chọn sử dụng mô hình qua **OpenRouter**, nhưng hệ thống chưa có API Key.\n\n"
+                    "👉 Vui lòng mở **Cài đặt & API Key**, chọn tab **OpenRouter** và nhập API Key (lấy tại https://openrouter.ai/keys) để tiếp tục."
+                )
+        else:
+            # Gemini default
+            gemini_key = self.get_setting("gemini_api_key", os.getenv("GEMINI_API_KEY", ""))
+            gemini_model = model or self.get_setting("gemini_model", self.get_setting("model_name", DEFAULT_GEMINI_CHAT_MODEL))
+
+            if gemini_key and len(gemini_key) > 10:
+                answer = await self._call_gemini_rag(gemini_key, gemini_model, question, context_str, chat_history)
+            else:
+                answer = self._generate_local_synthesis(question, chunks)
+
+        return {
+            "answer": stale_note + answer,
+            "sources": sources
+        }
+
+    async def _call_openrouter_rag(
+        self,
+        api_key: str,
+        model: str,
+        question: str,
+        context: str,
+        chat_history: Optional[List[Dict[str, str]]] = None
+    ) -> str:
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key.strip()}",
+            "HTTP-Referer": "http://localhost:8000",
+            "X-Title": "Second Brain AI",
+            "Content-Type": "application/json"
+        }
+
+        system_instruction = (
+            "Bạn là trợ lý AI thông minh phụ trách Second Brain (Bộ não thứ hai cá nhân). "
+            "Nhiệm vụ của bạn là trả lời câu hỏi của người dùng dựa trên Ngữ cảnh Kiến thức (Context) được cung cấp từ các ghi chú và tài liệu của họ. "
+            "Quy tắc trả lời:\n"
+            "1. Luôn ưu tiên thông tin chính xác từ Ngữ cảnh kiến thức.\n"
+            "2. Trích dẫn rõ ràng nguồn từ ghi chú hoặc tài liệu nào (ví dụ: 'Theo ghi chú [Tên ghi chú]...').\n"
+            "3. Nếu ngữ cảnh không có thông tin, hãy thành thật nêu rõ Second Brain chưa có dữ liệu về điều này trước khi trả lời khái quát.\n"
+            "4. Định dạng Markdown rõ ràng, dễ đọc, gạch đầu dòng các ý quan trọng."
+        )
+
+        messages = [{"role": "system", "content": system_instruction}]
+        if chat_history:
+            for msg in chat_history[-6:]:
+                role = "user" if msg["role"] == "user" else "assistant"
+                messages.append({"role": role, "content": msg["content"]})
+
+        user_content = f"Ngữ cảnh kiến thức từ Second Brain:\n---\n{context}\n---\n\nCâu hỏi: {question}"
+        messages.append({"role": "user", "content": user_content})
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.4,
+            "max_tokens": 2048
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    choices = data.get("choices", [])
+                    if choices and "message" in choices[0]:
+                        return choices[0]["message"].get("content", "")
+                else:
+                    return f"Lỗi gọi OpenRouter API ({resp.status_code}): {resp.text}"
+        except Exception as e:
+            return f"Không thể kết nối đến OpenRouter API: {str(e)}"
+
+        return "Không nhận được phản hồi từ mô hình OpenRouter."
+
+    async def _call_gemini_rag(
+        self,
+        api_key: str,
+        model: str,
+        question: str,
+        context: str,
+        chat_history: Optional[List[Dict[str, str]]] = None
+    ) -> str:
+        url = f"{GEMINI_BASE}/models/{model}:generateContent"
+
+        system_instruction = (
+            "Bạn là trợ lý AI thông minh phụ trách Second Brain (Bộ não thứ hai cá nhân). "
+            "Nhiệm vụ của bạn là trả lời câu hỏi của người dùng dựa trên Ngữ cảnh Kiến thức (Context) được cung cấp từ các ghi chú và tài liệu của họ. "
+            "Quy tắc trả lời:\n"
+            "1. Luôn ưu tiên thông tin chính xác từ Ngữ cảnh kiến thức.\n"
+            "2. Trích dẫn rõ ràng nguồn từ ghi chú hoặc tài liệu nào (ví dụ: 'Theo ghi chú [Tên ghi chú]...').\n"
+            "3. Nếu ngữ cảnh không có thông tin, hãy thành thật nêu rõ Second Brain chưa có dữ liệu về điều này trước khi trả lời khái quát.\n"
+            "4. Định dạng Markdown rõ ràng, dễ đọc, gạch đầu dòng các ý quan trọng."
+        )
+
+        contents = []
+        if chat_history:
+            for msg in chat_history[-6:]:  # Keep recent context
+                role = "user" if msg["role"] == "user" else "model"
+                contents.append({
+                    "role": role,
+                    "parts": [{"text": msg["content"]}]
+                })
+
+        user_prompt = f"Ngữ cảnh kiến thức từ Second Brain:\n---\n{context}\n---\n\nCâu hỏi: {question}"
+        contents.append({
+            "role": "user",
+            "parts": [{"text": user_prompt}]
+        })
+
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": system_instruction}]
+            },
+            "contents": contents,
+            "generationConfig": {
+                "temperature": 0.4,
+                "maxOutputTokens": 2048
+            }
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=90.0, transport=getattr(self, "_transport", None)) as client:
+                resp = await client.post(url, json=payload, headers={"x-goog-api-key": api_key})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    if candidates and "content" in candidates[0]:
+                        parts = candidates[0]["content"].get("parts", [])
+                        # newer models may return "thought" parts first: keep only the answer text
+                        text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+                        if text:
+                            return text
+                else:
+                    return f"Lỗi gọi Gemini API ({resp.status_code}): {resp.text}"
+        except Exception as e:
+            return f"Không thể kết nối đến Gemini API: {str(e)}"
+
+        return "Không nhận được phản hồi từ AI."
+
+    def _generate_local_synthesis(self, question: str, chunks: List[Dict[str, Any]]) -> str:
+        """Fallback synthesis when no Gemini API key is configured yet."""
+        # keyword hits have cosine 0.0 by design, so judge relevance by how the chunk was matched
+        relevant = any(c.get("match", "semantic") != "semantic" or c["score"] > 0.05 for c in chunks)
+        if not chunks or not relevant:
+            return (
+                f"### 🔍 Không tìm thấy thông tin phù hợp\n\n"
+                f"Second Brain chưa tìm thấy ghi chú hoặc tài liệu nào liên quan trực tiếp đến câu hỏi: **\"{question}\"**.\n\n"
+                f"💡 **Gợi ý**:\n"
+                f"- Thử thêm ghi chú mới hoặc tải lên tài liệu PDF/Text liên quan đến chủ đề này.\n"
+                f"- Để kích hoạt AI thông minh trò chuyện tự nhiên, bạn có thể nhập **Gemini API Key** trong phần **Cài đặt** (Settings)."
+            )
+
+        top_sources = list({c["source_title"] for c in chunks[:3]})
+        sources_str = ", ".join([f"`{s}`" for s in top_sources])
+
+        res = [
+            f"### 💡 Kết quả trích xuất từ Second Brain\n\n",
+            f"Tìm thấy các đoạn kiến thức liên quan từ nguồn: {sources_str}\n\n"
+        ]
+
+        for i, c in enumerate(chunks[:3]):
+            icon = "📝 Ghi chú" if c["source_type"] == "note" else "📄 Tài liệu"
+            res.append(f"#### {i+1}. {icon}: **{c['source_title']}** (Độ tương đồng: {int(c['score']*100)}%)\n")
+            res.append(f"> {c['content'].strip()}\n\n")
+
+        res.append(
+            "\n---\n"
+            "🔑 *Mẹo: Bạn có thể nhập **Google Gemini API Key** trong phần **Cài đặt** để AI tự động phân tích sâu, tóm tắt và trò chuyện như một người trợ lý cá nhân.*"
+        )
+
+        return "".join(res)
+
+
+rag_service = RAGService()

@@ -1,0 +1,2 @@
+# Optional: chạy embedding đa ngôn ngữ ngay trên máy (không cần API key)
+fastembed>=0.4.0
