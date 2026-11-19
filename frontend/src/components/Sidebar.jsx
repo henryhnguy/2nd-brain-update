@@ -10,6 +10,7 @@ import {
   Tag, 
   BrainCircuit,
   Wand2,
+  Network,
   Plus
 } from 'lucide-react';
 
@@ -29,6 +30,7 @@ export default function Sidebar({
     { id: 'chat', label: 'AI Copilot (RAG)', icon: Bot, badge: 'AI' },
     { id: 'search', label: 'Tìm kiếm lai (ngữ nghĩa + từ khóa)', icon: Search },
     { id: 'studio', label: 'Studio (Bài học · SOP · Tổng hợp)', icon: Wand2, badge: 'AI' },
+    { id: 'ontology', label: 'Ontology (Thuật ngữ & quan hệ)', icon: Network },
   ];
 
   return (

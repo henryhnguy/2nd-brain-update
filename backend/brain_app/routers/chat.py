@@ -115,7 +115,8 @@ async def chat_query(req: ChatQueryRequest):
         question,
         chat_history=chat_history,
         provider=req.provider,
-        model=req.model
+        model=req.model,
+        filters=req.filters
     )
     answer = rag_result["answer"]
     sources = rag_result["sources"]

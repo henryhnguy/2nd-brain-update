@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from brain_app.database import init_db, get_db_connection
-from brain_app.routers import notes, documents, chat, search, settings, studio
+from brain_app.routers import notes, documents, chat, search, settings, studio, ontology
 from brain_app.rag.rag_service import rag_service
 from brain_app.rag.embeddings import embedding_service
 from brain_app.rag.vector_store import vector_store
@@ -75,6 +75,7 @@ app.include_router(chat.router)
 app.include_router(search.router)
 app.include_router(settings.router)
 app.include_router(studio.router)
+app.include_router(ontology.router)
 
 
 @app.get("/api/health")

@@ -10,6 +10,7 @@ from brain_app.database import get_db_connection
 from brain_app.rag import llm
 from brain_app.rag.embeddings import EmbeddingError, embedding_service
 from brain_app.rag.vector_store import vector_store
+from brain_app.ontology import store as ontology
 from brain_app.studio import prompts, quality, store
 from brain_app.studio.kinds import KINDS, SOP_PROCEDURE_TITLE, SOP_TEMPLATE
 
@@ -59,7 +60,7 @@ async def retrieve(doc: Dict[str, Any], query: str, k: int = SECTION_TOP_K,
         qv = await embedding_service.embed_query(query)
     except EmbeddingError:
         pass  # keyword-only retrieval still works
-    return vector_store.hybrid_search(query, qv, model_tag=embedding_service.active_tag(), top_k=k, allowed=allowed)
+    return vector_store.hybrid_search(ontology.expand_query(query), qv, model_tag=embedding_service.active_tag(), top_k=k, allowed=allowed)
 
 
 def register_sources(doc_id: int, chunks: List[Dict[str, Any]]) -> Dict[Tuple[str, int], int]:
@@ -251,6 +252,9 @@ async def write_section(doc_id: int, sid: str) -> Dict[str, Any]:
     chunks = await retrieve(doc, query, SECTION_TOP_K, restrict=restrict)
     numbering = register_sources(doc_id, chunks)
     context = context_block(chunks, numbering)
+    glossary = ontology.glossary_block(query)  # thuật ngữ đã duyệt xuất hiện trong chủ đề/mục đang viết
+    if glossary:
+        context = f"{glossary}\n\n{context}".strip()
     if kind == "synthesis":
         sums = "\n\n".join(f"[{n}] Tóm tắt nguồn:\n{doc['summaries'].get(str(n), '')}" for n in section.get("sources", []))
         context = f"{sums}\n\n{context}".strip()

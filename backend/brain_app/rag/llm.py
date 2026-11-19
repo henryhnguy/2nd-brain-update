@@ -1,4 +1,4 @@
-"""Provider-agnostic text generation (Gemini or OpenRouter) used by Studio.
+"""Provider-agnostic text generation (Gemini, OpenRouter or a custom OpenAI-compatible provider) used by Studio.
 
 The chat/RAG path has its own provider code; this module is the generic "system prompt in,
 text (or JSON) out" primitive. All failures raise LLMError with a message fit for the UI.
@@ -14,6 +14,7 @@ import httpx
 from brain_app.database import get_db_connection
 from brain_app.rag.embeddings import GEMINI_BASE
 from brain_app.rag.model_catalog import DEFAULT_GEMINI_CHAT_MODEL
+from brain_app.rag import custom_providers
 
 _transport: Optional[httpx.AsyncBaseTransport] = None  # tests inject a mock here
 
@@ -36,6 +37,11 @@ def _setting(key: str, default: str = "") -> str:
 def resolve() -> Dict[str, str]:
     """Which provider/model/key to use, from saved settings. provider '' means not configured."""
     provider = (_setting("llm_provider", "gemini") or "gemini").lower()
+    if provider.startswith("custom:"):
+        cfg = custom_providers.active_cfg(provider[7:])
+        if cfg and cfg["model"]:
+            return cfg
+        return {"provider": "", "model": "", "key": ""}  # provider đã bị xoá hoặc chưa có model
     if provider == "openrouter":
         key = _setting("openrouter_api_key", "").strip()
         model = _setting("openrouter_model", "") or "deepseek/deepseek-chat"
@@ -76,6 +82,8 @@ async def complete(system: str, user: str, *, json_mode: bool = False, temperatu
         raise LLMError("Chưa cấu hình API key cho mô hình AI (Cài đặt → Google Gemini hoặc OpenRouter).")
     if cfg["provider"] == "gemini":
         return await _gemini(cfg, system, user, json_mode, temperature, max_tokens)
+    if cfg["provider"] == "custom":
+        return await _custom(cfg, system, user, json_mode, temperature, max_tokens)
     return await _openrouter(cfg, system, user, json_mode, temperature, max_tokens)
 
 
@@ -143,24 +151,34 @@ async def _gemini(cfg, system, user, json_mode, temperature, max_tokens) -> str:
 
 
 async def _openrouter(cfg, system, user, json_mode, temperature, max_tokens) -> str:
-    url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {"Authorization": f"Bearer {cfg['key']}", "HTTP-Referer": "http://localhost:8000",
                "X-Title": "Second Brain AI", "Content-Type": "application/json"}
-    body: Dict[str, Any] = {"model": cfg["model"], "temperature": temperature, "max_tokens": max_tokens,
+    return await _chat_completions("https://openrouter.ai/api/v1/chat/completions", headers, "OpenRouter",
+                                   cfg["model"], system, user, json_mode, temperature, max_tokens)
+
+
+async def _custom(cfg, system, user, json_mode, temperature, max_tokens) -> str:
+    """Provider tùy chỉnh chuẩn OpenAI. json_mode='off' trong cấu hình: không gửi response_format."""
+    return await _chat_completions(cfg["chat_url"], cfg["headers"], cfg["label"], cfg["model"], system, user,
+                                   json_mode and cfg.get("json_mode") != "off", temperature, max_tokens)
+
+
+async def _chat_completions(url, headers, label, model, system, user, json_mode, temperature, max_tokens) -> str:
+    body: Dict[str, Any] = {"model": model, "temperature": temperature, "max_tokens": max_tokens,
                             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     if json_mode:
         body["response_format"] = {"type": "json_object"}
     async with httpx.AsyncClient(timeout=180.0, transport=_transport) as client:
-        resp = await _post_with_retry(client, url, headers, body, "OpenRouter")
+        resp = await _post_with_retry(client, url, headers, body, label)
         if resp.status_code == 400 and json_mode:  # some models reject response_format: retry plain
             body.pop("response_format", None)
-            resp = await _post_with_retry(client, url, headers, body, "OpenRouter")
+            resp = await _post_with_retry(client, url, headers, body, label)
     if resp.status_code != 200:
-        raise LLMError(f"OpenRouter lỗi {resp.status_code}: {_err_text(resp)}")
+        raise LLMError(f"{label} lỗi {resp.status_code}: {_err_text(resp)}")
     try:
         text = resp.json()["choices"][0]["message"]["content"] or ""
     except Exception:
-        raise LLMError("OpenRouter trả về phản hồi không đúng định dạng.")
+        raise LLMError(f"{label} trả về phản hồi không đúng định dạng.")
     if not text.strip():
-        raise LLMError("OpenRouter trả về nội dung rỗng.")
+        raise LLMError(f"{label} trả về nội dung rỗng.")
     return text

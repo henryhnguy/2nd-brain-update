@@ -101,8 +101,14 @@ async def _fetch(provider: str) -> List[Dict[str, str]]:
 
 
 async def list_models(provider: str, refresh: bool = False) -> Dict[str, Any]:
+    if provider.startswith("custom:"):
+        from brain_app.rag import custom_providers  # tránh import vòng
+        try:
+            return await custom_providers.list_models(provider[7:], refresh)
+        except custom_providers.CustomProviderError as e:
+            raise ValueError(e.message)
     if provider not in ("gemini", "openrouter"):
-        raise ValueError("provider phải là 'gemini' hoặc 'openrouter'")
+        raise ValueError("provider phải là 'gemini', 'openrouter' hoặc 'custom:<id>'")
     cache_key = provider + (":" + embedding_service.gemini_key()[-6:] if provider == "gemini" else "")
     hit = _cache.get(cache_key)
     if hit and not refresh and time.time() - hit[0] < CACHE_TTL:

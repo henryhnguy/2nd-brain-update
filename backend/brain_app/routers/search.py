@@ -6,6 +6,7 @@ from fastapi import APIRouter, Query, Response
 from brain_app.models import SearchResult
 from brain_app.rag.embeddings import embedding_service, EmbeddingError
 from brain_app.rag.vector_store import vector_store
+from brain_app.ontology import store as ontology
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
@@ -31,8 +32,13 @@ async def search(
     except EmbeddingError as e:
         response.headers["X-Search-Warning"] = quote(str(e))
 
+    # Ontology: mở rộng phần tìm từ khoá bằng tên chuẩn/tên gọi khác của thuật ngữ đã duyệt (embedding giữ câu gốc)
+    keyword_q = ontology.expand_query(q)
+    if keyword_q != q:
+        response.headers["X-Search-Expanded"] = quote(keyword_q[len(q):].strip())
+
     results = vector_store.hybrid_search(
-        q, query_vector, model_tag=embedding_service.active_tag(), top_k=limit, source_type=source_type)
+        keyword_q, query_vector, model_tag=embedding_service.active_tag(), top_k=limit, source_type=source_type)
 
     return [
         SearchResult(

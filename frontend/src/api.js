@@ -68,7 +68,9 @@ export const api = {
       method: 'POST',
       body: formData
     });
-    return res.json();
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.error || data.detail || `Lỗi ${res.status}`);
+    return data;
   },
   deleteDocument: async (id) => {
     const res = await fetch(`${API_BASE}/documents/${id}`, { method: 'DELETE' });
@@ -94,10 +96,11 @@ export const api = {
     const res = await fetch(`${API_BASE}/chat/sessions/${sessionId}/messages`);
     return res.json();
   },
-  askQuery: async (sessionId, question, provider = null, model = null) => {
+  askQuery: async (sessionId, question, provider = null, model = null, filters = null) => {
     const payload = { session_id: sessionId, question };
     if (provider) payload.provider = provider;
     if (model) payload.model = model;
+    if (filters) payload.filters = filters;
     const res = await fetch(`${API_BASE}/chat/query`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -170,4 +173,25 @@ export const api = {
   studioGetVersion: (id, version) => studioReq(`/studio/docs/${id}/versions/${encodeURIComponent(version)}`),
   studioMarkdown: (id) => studioReq(`/studio/docs/${id}/markdown`),
   studioSaveNote: (id, category, tags = []) => studioReq(`/studio/docs/${id}/save-note`, { method: 'POST', body: { category, tags } }),
+  // ---- Provider AI tùy chỉnh (chuẩn OpenAI) ----
+  customProviders: () => studioReq('/settings/custom-providers'),
+  saveCustomProvider: (body) => studioReq('/settings/custom-providers', { method: 'POST', body }),
+  deleteCustomProvider: (id) => studioReq(`/settings/custom-providers/${id}`, { method: 'DELETE' }),
+  testCustomProvider: (id, model) => studioReq(`/settings/custom-providers/${id}/test`, { method: 'POST', body: model ? { model } : {} }),
+  // ---- Ontology (thuật ngữ, quan hệ, dẫn chứng) ----
+  ontoMeta: () => studioReq('/ontology/meta'),
+  ontoTerms: (status = '', q = '') => studioReq(`/ontology/terms?${new URLSearchParams({ ...(status ? { status } : {}), ...(q ? { q } : {}) })}`),
+  ontoGet: (id) => studioReq(`/ontology/terms/${id}`),
+  ontoCreate: (body) => studioReq('/ontology/terms', { method: 'POST', body }),
+  ontoUpdate: (id, body) => studioReq(`/ontology/terms/${id}`, { method: 'PATCH', body }),
+  ontoApprove: (id) => studioReq(`/ontology/terms/${id}/approve`, { method: 'POST' }),
+  ontoUnapprove: (id) => studioReq(`/ontology/terms/${id}/unapprove`, { method: 'POST' }),
+  ontoDelete: (id) => studioReq(`/ontology/terms/${id}`, { method: 'DELETE' }),
+  ontoAddRelation: (body) => studioReq('/ontology/relations', { method: 'POST', body }),
+  ontoDeleteRelation: (id) => studioReq(`/ontology/relations/${id}`, { method: 'DELETE' }),
+  ontoAddEvidence: (id, body) => studioReq(`/ontology/terms/${id}/evidence`, { method: 'POST', body }),
+  ontoDeleteEvidence: (id) => studioReq(`/ontology/evidence/${id}`, { method: 'DELETE' }),
+  ontoSuggest: (body = {}) => studioReq('/ontology/suggest', { method: 'POST', body }),
+  ontoAccept: (candidates) => studioReq('/ontology/suggest/accept', { method: 'POST', body: { candidates } }),
+  ontoImport: (data) => studioReq('/ontology/import', { method: 'POST', body: data }),
 };

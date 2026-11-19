@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { X, Key, Check, Database, Cpu, ExternalLink, ShieldCheck, Globe, Sparkles, Layers, RefreshCw, AlertTriangle } from 'lucide-react';
+import { X, Key, Check, Database, Cpu, ExternalLink, ShieldCheck, Globe, Sparkles, Layers, RefreshCw, AlertTriangle, Server } from 'lucide-react';
+import CustomProvidersPanel from './CustomProvidersPanel';
 import { api } from '../api';
 import { useModelCatalog } from '../useModelCatalog';
 
-export default function SettingsModal({ isOpen, onClose, settings, onSaveSettings }) {
-  const [activeTab, setActiveTab] = useState('gemini'); // 'gemini' | 'openrouter' | 'embedding'
+export default function SettingsModal({ isOpen, onClose, settings, onSaveSettings, onRefreshSettings }) {
+  const [activeTab, setActiveTab] = useState('gemini'); // 'gemini' | 'openrouter' | 'custom' | 'embedding'
   const [llmProvider, setLlmProvider] = useState('gemini');
   
   // Gemini
@@ -25,6 +26,7 @@ export default function SettingsModal({ isOpen, onClose, settings, onSaveSetting
   const [embTest, setEmbTest] = useState(null);
   const [embBusy, setEmbBusy] = useState('');
   const [orFilter, setOrFilter] = useState('');
+  const [geminiOtherModel, setGeminiOtherModel] = useState('');
   const geminiCatalog = useModelCatalog('gemini', isOpen && activeTab === 'gemini');
   const orCatalog = useModelCatalog('openrouter', isOpen && activeTab === 'openrouter');
 
@@ -34,7 +36,7 @@ export default function SettingsModal({ isOpen, onClose, settings, onSaveSetting
   useEffect(() => {
     if (settings) {
       setLlmProvider(settings.llm_provider || 'gemini');
-      setActiveTab((t) => (t === 'embedding' ? t : settings.llm_provider || 'gemini'));
+      setActiveTab((t) => (t === 'embedding' || t === 'custom' ? t : (settings.llm_provider || 'gemini').startsWith('custom:') ? 'custom' : settings.llm_provider || 'gemini'));
       if (settings.embedding) {
         setEmbStatus(settings.embedding);
         setEmbProvider(settings.embedding.configured_provider || 'auto');
@@ -197,6 +199,23 @@ export default function SettingsModal({ isOpen, onClose, settings, onSaveSetting
             </button>
 
             <button
+              onClick={() => setActiveTab('custom')}
+              className={`flex items-center space-x-2 pb-3 px-3 text-xs font-semibold border-b-2 transition-all ${
+                activeTab === 'custom'
+                  ? 'border-indigo-500 text-indigo-400'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Server className="w-3.5 h-3.5" />
+              <span>Tùy chỉnh</span>
+              {llmProvider.startsWith('custom:') && (
+                <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-violet-500/20 text-violet-300 font-mono">
+                  Mặc định
+                </span>
+              )}
+            </button>
+
+            <button
               onClick={() => setActiveTab('embedding')}
               className={`flex items-center space-x-2 pb-3 px-3 text-xs font-semibold border-b-2 transition-all ${
                 activeTab === 'embedding'
@@ -216,12 +235,12 @@ export default function SettingsModal({ isOpen, onClose, settings, onSaveSetting
         {/* Body */}
         <div className="p-6 overflow-y-auto space-y-5 flex-1">
           {/* Active Provider Selector */}
-          {activeTab !== 'embedding' && (
+          {activeTab !== 'embedding' && activeTab !== 'custom' && (
           <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl flex items-center justify-between">
             <div className="text-xs">
               <span className="text-slate-400">Nhà cung cấp AI mặc định: </span>
               <span className="font-semibold text-slate-200 uppercase">
-                {llmProvider === 'gemini' ? 'Google Gemini' : 'OpenRouter'}
+                {llmProvider === 'gemini' ? 'Google Gemini' : llmProvider === 'openrouter' ? 'OpenRouter' : ((settings?.custom_providers || []).find((p) => `custom:${p.id}` === llmProvider)?.name || 'Tùy chỉnh')}
               </span>
             </div>
             <button
@@ -292,6 +311,24 @@ export default function SettingsModal({ isOpen, onClose, settings, onSaveSetting
                     </option>
                   ))}
                 </select>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={geminiOtherModel}
+                    onChange={(e) => setGeminiOtherModel(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter' && geminiOtherModel.trim()) { e.preventDefault(); setGeminiModel(geminiOtherModel.trim()); setGeminiOtherModel(''); } }}
+                    placeholder="Model chưa có trong danh sách? Nhập ID rồi Enter"
+                    className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-[11px] text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                  <button
+                    type="button"
+                    disabled={!geminiOtherModel.trim()}
+                    onClick={() => { setGeminiModel(geminiOtherModel.trim()); setGeminiOtherModel(''); }}
+                    className="px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] disabled:opacity-40"
+                  >
+                    Dùng
+                  </button>
+                </div>
                 <div className="flex items-center justify-between text-[10px] text-slate-500">
                   <span>
                     {geminiCatalog.loading
@@ -414,6 +451,11 @@ export default function SettingsModal({ isOpen, onClose, settings, onSaveSetting
           )}
 
           {/* Embedding Tab Settings */}
+          {/* Custom (OpenAI-compatible) providers */}
+          {activeTab === 'custom' && (
+            <CustomProvidersPanel llmProvider={llmProvider} onSetDefault={(ref) => setLlmProvider(ref)} onChanged={() => onRefreshSettings && onRefreshSettings()} />
+          )}
+
           {activeTab === 'embedding' && (
             <div className="space-y-4">
               <p className="text-[11px] text-slate-400 leading-relaxed">

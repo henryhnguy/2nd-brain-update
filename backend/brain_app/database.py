@@ -122,6 +122,52 @@ def init_db():
     );
     """)
 
+    # Ontology: thuật ngữ do người duyệt (draft -> approved), tên gọi khác, quan hệ, dẫn chứng
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS ontology_terms (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'concept',
+        definition TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'draft',   -- 'draft' | 'approved' (chỉ 'approved' ảnh hưởng AI)
+        approved_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS ontology_aliases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        term_id INTEGER NOT NULL,
+        alias TEXT NOT NULL
+    );
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS ontology_relations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_id INTEGER NOT NULL,
+        to_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        note TEXT DEFAULT ''
+    );
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS ontology_evidence (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        term_id INTEGER NOT NULL,
+        source_type TEXT NOT NULL,
+        source_id INTEGER NOT NULL,
+        source_title TEXT DEFAULT '',
+        quote TEXT NOT NULL,
+        verified INTEGER NOT NULL DEFAULT 0,   -- 1 = câu trích có thật trong nguồn
+        created_at TEXT NOT NULL
+    );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_onto_alias_term ON ontology_aliases(term_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_onto_rel_from ON ontology_relations(from_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_onto_rel_to ON ontology_relations(to_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_onto_ev_term ON ontology_evidence(term_id)")
+
     # Chat Sessions
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS chat_sessions (

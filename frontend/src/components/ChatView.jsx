@@ -16,7 +16,8 @@ import {
   CornerDownLeft,
   Globe,
   Settings,
-  Cpu
+  Cpu,
+  Server
 } from 'lucide-react';
 
 export default function ChatView({
@@ -45,7 +46,10 @@ export default function ChatView({
     if (settings) {
       const prov = settings.llm_provider || 'gemini';
       setSelectedProvider(prov);
-      if (prov === 'openrouter') {
+      if (prov.startsWith('custom:')) {
+        const cp = (settings.custom_providers || []).find((p) => `custom:${p.id}` === prov);
+        setSelectedModel(cp?.default_model || '');
+      } else if (prov === 'openrouter') {
         setSelectedModel(settings.openrouter_model || 'deepseek/deepseek-chat');
       } else {
         setSelectedModel(settings.gemini_model || settings.model_name || 'gemini-2.5-flash');
@@ -158,7 +162,9 @@ export default function ChatView({
           {/* Model Switcher Dropdown */}
           <div className="flex items-center space-x-2">
             <div className="flex items-center space-x-1.5 bg-slate-800/90 border border-slate-700/80 rounded-lg px-2.5 py-1">
-              {selectedProvider === 'openrouter' ? (
+              {selectedProvider.startsWith('custom:') ? (
+                <Server className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+              ) : selectedProvider === 'openrouter' ? (
                 <Globe className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
               ) : (
                 <Sparkles className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
@@ -167,9 +173,10 @@ export default function ChatView({
               <select
                 value={`${selectedProvider}::${selectedModel}`}
                 onChange={(e) => {
-                  const [prov, mod] = e.target.value.split('::');
-                  setSelectedProvider(prov);
-                  setSelectedModel(mod);
+                  const v = e.target.value;
+                  const cut = v.indexOf('::');
+                  setSelectedProvider(v.slice(0, cut));
+                  setSelectedModel(v.slice(cut + 2));
                 }}
                 className="bg-transparent text-xs text-slate-200 focus:outline-none cursor-pointer pr-1"
               >
@@ -197,6 +204,15 @@ export default function ChatView({
                     </option>
                   )}
                 </optgroup>
+                {(settings?.custom_providers || []).map((cp) => (
+                  <optgroup key={cp.id} label={`🔌 ${cp.name}`}>
+                    {cp.models.map((m) => (
+                      <option key={`custom:${cp.id}::${m}`} value={`custom:${cp.id}::${m}`} className="bg-slate-900 text-slate-100">
+                        {cp.name} - {m}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
               </select>
             </div>
 
@@ -223,7 +239,7 @@ export default function ChatView({
                   Trợ lý AI Second Brain
                 </h2>
                 <p className="text-xs text-slate-400 leading-relaxed">
-                  Đang sử dụng mô hình <strong className="text-indigo-400">{selectedModel}</strong> ({selectedProvider === 'openrouter' ? 'OpenRouter' : 'Google Gemini'}).
+                  Đang sử dụng mô hình <strong className="text-indigo-400">{selectedModel}</strong> ({selectedProvider.startsWith('custom:') ? ((settings?.custom_providers || []).find((p) => `custom:${p.id}` === selectedProvider)?.name || 'Tùy chỉnh') : selectedProvider === 'openrouter' ? 'OpenRouter' : 'Google Gemini'}).
                   Hệ thống sẽ tra cứu toàn bộ ghi chú và tài liệu cá nhân để trả lời chính xác nhất:
                 </p>
               </div>

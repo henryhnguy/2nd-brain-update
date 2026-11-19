@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { api } from './api';
 import StudioView from './components/StudioView';
+import OntologyView from './components/OntologyView';
 import Sidebar from './components/Sidebar';
 import NotesView from './components/NotesView';
 import DocumentsView from './components/DocumentsView';
@@ -118,8 +119,13 @@ export default function App() {
 
   // Document Handlers
   const handleUploadDoc = async (file) => {
-    await api.uploadDocument(file);
-    await refreshDocs();
+    let result;
+    try {
+      result = await api.uploadDocument(file);
+    } finally {
+      await refreshDocs();
+    }
+    if (result.embedding_pending) throw new Error(result.embedding_error || 'Đã lưu nội dung nhưng chưa tạo embedding. Kiểm tra Cài đặt → Embedding.');
   };
 
   const handleDeleteDoc = async (id) => {
@@ -153,7 +159,7 @@ export default function App() {
     }
   };
 
-  const handleSendMessage = async (text, provider = null, model = null) => {
+  const handleSendMessage = async (text, provider = null, model = null, filters = null) => {
     setIsChatLoading(true);
     // Optimistic UI for user message
     const tempUserMsg = {
@@ -167,7 +173,7 @@ export default function App() {
     setMessages((prev) => [...prev, tempUserMsg]);
 
     try {
-      const resp = await api.askQuery(currentSessionId, text, provider, model);
+      const resp = await api.askQuery(currentSessionId, text, provider, model, filters);
       if (!currentSessionId && resp.session_id) {
         setCurrentSessionId(resp.session_id);
         const updatedSessions = await api.getSessions();
@@ -190,10 +196,10 @@ export default function App() {
   };
 
   // Switch to Chat with a pre-filled prompt
-  const handleAskAIWithPrompt = (prompt) => {
+  const handleAskAIWithPrompt = (prompt, filters = null) => {
     setActiveTab('chat');
     setChatPromptPending(prompt);
-    handleSendMessage(prompt);
+    handleSendMessage(prompt, null, null, filters);
   };
 
   // Search Note Selection
@@ -270,6 +276,8 @@ export default function App() {
         )}
 
         {activeTab === 'studio' && <StudioView />}
+
+        {activeTab === 'ontology' && <OntologyView documents={documents} />}
       </main>
 
       {/* Settings Modal */}
@@ -282,6 +290,7 @@ export default function App() {
           const s = await api.getSettings();
           setSettings(s);
         }}
+        onRefreshSettings={async () => setSettings(await api.getSettings())}
       />
     </div>
   );

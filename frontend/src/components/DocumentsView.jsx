@@ -20,6 +20,7 @@ export default function DocumentsView({
 }) {
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState('');
   const fileInputRef = useRef(null);
 
   const handleDragOver = (e) => {
@@ -47,10 +48,16 @@ export default function DocumentsView({
 
   const uploadFiles = async (files) => {
     setUploading(true);
-    for (let i = 0; i < files.length; i++) {
-      await onUpload(files[i]);
+    setUploadError('');
+    try {
+      for (let i = 0; i < files.length; i++) {
+        await onUpload(files[i]);
+      }
+    } catch (error) {
+      setUploadError(error.message || 'Không thể tải và lập chỉ mục tài liệu.');
+    } finally {
+      setUploading(false);
     }
-    setUploading(false);
   };
 
   const formatSize = (bytes) => {
@@ -112,6 +119,12 @@ export default function DocumentsView({
           </p>
         </div>
 
+        {uploadError && (
+          <div role="alert" className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-300">
+            {uploadError}
+          </div>
+        )}
+
         {/* Documents List */}
         <div>
           <div className="flex items-center justify-between mb-4">
@@ -151,6 +164,8 @@ export default function DocumentsView({
                           <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">
                             {doc.file_type.toUpperCase()}
                           </span>
+                          {doc.status === 'pending' && <span className="text-[10px] text-amber-300">Chờ embedding</span>}
+                          {doc.status === 'error' && <span className="text-[10px] text-rose-300">Lỗi lập chỉ mục</span>}
                         </div>
 
                         {doc.summary && (
@@ -175,7 +190,7 @@ export default function DocumentsView({
 
                     <div className="flex items-center space-x-2 shrink-0 self-end md:self-center">
                       <button
-                        onClick={() => onAskAI(`Tóm tắt nội dung và các ý chính của tài liệu "${doc.filename}"`)}
+                        onClick={() => onAskAI(`Tóm tắt nội dung và các ý chính của tài liệu "${doc.filename}"`, { source_type: 'document', source_id: doc.id })}
                         className="flex items-center space-x-1 px-3 py-1.5 rounded-lg bg-indigo-600/10 hover:bg-indigo-600/20 text-indigo-300 text-xs font-medium border border-indigo-500/20 transition-colors"
                       >
                         <MessageSquare className="w-3.5 h-3.5" />

@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import httpx
@@ -10,6 +11,8 @@ from brain_app.rag.chunker import chunk_text
 from brain_app.rag.embeddings import embedding_service, EmbeddingError, GEMINI_BASE
 from brain_app.rag.model_catalog import DEFAULT_GEMINI_CHAT_MODEL
 from brain_app.rag.vector_store import vector_store
+from brain_app.ontology import store as ontology
+from brain_app.rag import custom_providers
 
 
 class RAGService:
@@ -40,14 +43,13 @@ class RAGService:
         return f"{prev[-1][:300]} {q}".strip() if prev else q
 
     async def _embed_chunk_texts(self, texts: List[str]):
-        """Returns (vectors, tag). On failure vectors are empty -> chunks are stored as 'pending'."""
+        """Returns vectors, their model tag, and any error that left them pending."""
         try:
             vecs = await embedding_service.embed_documents(texts)
-            return vecs, embedding_service.active_tag()
+            return vecs, embedding_service.active_tag(), ""
         except EmbeddingError as e:
             print(f"[RAG] Embedding failed, chunks stored as pending: {e}")
-            self.last_embedding_error = str(e)
-            return [[] for _ in texts], ""
+            return [[] for _ in texts], "", str(e)
 
     async def index_note(self, note_id: int, title: str, content: str, category: str = "", tags: List[str] = None):
         """Re-chunks and re-indexes a single note."""
@@ -57,7 +59,7 @@ class RAGService:
         chunks = chunk_text(full_text)
 
         now = datetime.utcnow().isoformat()
-        vecs, tag = await self._embed_chunk_texts([c["content"] for c in chunks])
+        vecs, tag, _ = await self._embed_chunk_texts([c["content"] for c in chunks])
         records = []
         for idx, c in enumerate(chunks):
             emb = vecs[idx]
@@ -104,7 +106,7 @@ class RAGService:
 
         chunks = chunk_text(extracted_text, chunk_size=800, overlap=120)
         now = datetime.utcnow().isoformat()
-        vecs, tag = await self._embed_chunk_texts([c["content"] for c in chunks])
+        vecs, tag, embedding_error = await self._embed_chunk_texts([c["content"] for c in chunks])
         embedding_pending = not tag
         records = []
         for idx, c in enumerate(chunks):
@@ -134,14 +136,14 @@ class RAGService:
         cursor = conn.cursor()
         cursor.execute("""
             UPDATE documents 
-            SET chunk_count = ?, summary = ?, status = 'indexed'
+            SET chunk_count = ?, summary = ?, status = ?
             WHERE id = ?
-        """, (len(chunks), summary, doc_id))
+        """, (len(chunks), summary, "pending" if embedding_pending else "indexed", doc_id))
         conn.commit()
         conn.close()
 
         return {"success": True, "chunk_count": len(chunks), "embedding_pending": embedding_pending,
-                "embedding_error": self.last_embedding_error if embedding_pending else ""}
+                "embedding_error": embedding_error}
 
     async def answer_query(
         self,
@@ -149,7 +151,8 @@ class RAGService:
         chat_history: Optional[List[Dict[str, str]]] = None,
         top_k: int = 8,
         provider: Optional[str] = None,
-        model: Optional[str] = None
+        model: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Main RAG pipeline:
@@ -159,7 +162,33 @@ class RAGService:
         """
         # Retrieval text: short follow-ups ("còn bước 2 thì sao?") are meaningless alone, so prepend
         # the previous user question(s) from the chat history for retrieval only.
-        retrieval_text = self._retrieval_text(question, chat_history)
+        retrieval_text = self._retrieval_text(question, None if filters else chat_history)
+
+        allowed = None
+        if filters and filters.get("source_type") and filters.get("source_id") is not None:
+            try:
+                source_type = str(filters["source_type"])
+                source_id = int(filters["source_id"])
+                if source_type in ("document", "note") and source_id > 0:
+                    allowed = {(source_type, source_id)}
+            except (TypeError, ValueError):
+                allowed = None
+
+        # Safety net for file-summary prompts: scope to the latest uploaded document
+        # whose exact filename appears in the question, even if a client omits filters.
+        if allowed is None:
+            normalize_name = lambda value: " ".join(re.findall(r"[\w]+", (value or "").casefold(), re.UNICODE))
+            normalized_question = normalize_name(question)
+            conn = get_db_connection()
+            docs = conn.execute(
+                "SELECT id, filename FROM documents ORDER BY created_at DESC, id DESC"
+            ).fetchall()
+            conn.close()
+            for doc in docs:
+                normalized_filename = normalize_name(doc["filename"])
+                if normalized_filename and normalized_filename in normalized_question:
+                    allowed = {("document", int(doc["id"]))}
+                    break
 
         # Embed (semantic) + keyword (FTS5), fused. If embedding fails, fall back to keyword-only
         # and tell the user why instead of silently degrading.
@@ -171,7 +200,15 @@ class RAGService:
         except EmbeddingError as e:
             embed_warning = str(e)
 
-        chunks = vector_store.hybrid_search(retrieval_text, q_emb, model_tag=tag, top_k=top_k)
+        # Ontology: phần tìm từ khoá được mở rộng bằng tên chuẩn/tên gọi khác của thuật ngữ ĐÃ DUYỆT
+        chunks = vector_store.hybrid_search(ontology.expand_query(retrieval_text), q_emb, model_tag=tag,
+                                            top_k=top_k, allowed=allowed)
+
+        if allowed is not None and not chunks:
+            return {
+                "answer": "Tài liệu được chọn chưa có đoạn văn bản phù hợp để trả lời. Có thể PDF là bản scan hoặc nội dung chưa được trích xuất đầy đủ.",
+                "sources": []
+            }
 
         if embed_warning and not chunks:
             return {
@@ -214,10 +251,27 @@ class RAGService:
 
         context_str = "\n\n".join(context_parts)
 
+        # Ontology: đưa định nghĩa thuật ngữ đã duyệt (xuất hiện trong câu hỏi) vào ngữ cảnh để AI dùng đúng nghĩa
+        glossary = ontology.glossary_block(f"{question} {retrieval_text}")
+        if glossary:
+            context_str = f"{glossary}\n\n{context_str}" if context_str else glossary
+
         # Determine active provider & model
         active_provider = (provider or self.get_setting("llm_provider", "gemini")).lower()
 
-        if active_provider == "openrouter":
+        if active_provider.startswith("custom:"):
+            cp = custom_providers.active_cfg(active_provider[7:])
+            if cp:
+                answer = await self._call_openrouter_rag(
+                    cp["key"], model or cp["model"], question, context_str, chat_history,
+                    url=cp["chat_url"], headers=cp["headers"], label=cp["label"], timeout=120.0)
+            else:
+                answer = (
+                    "### ⚠️ Provider tùy chỉnh không còn tồn tại\n\n"
+                    "Provider bạn chọn đã bị xoá hoặc chưa được cấu hình.\n\n"
+                    "👉 Mở **Cài đặt & API Key → Tùy chỉnh** để thêm lại, hoặc chọn một model khác."
+                )
+        elif active_provider == "openrouter":
             or_key = self.get_setting("openrouter_api_key", os.getenv("OPENROUTER_API_KEY", ""))
             or_model = model or self.get_setting("openrouter_model", "deepseek/deepseek-chat")
             if or_key and len(or_key) > 5:
@@ -237,6 +291,8 @@ class RAGService:
                 answer = await self._call_gemini_rag(gemini_key, gemini_model, question, context_str, chat_history)
             else:
                 answer = self._generate_local_synthesis(question, chunks)
+                if glossary:
+                    answer = f"> **Thuật ngữ liên quan**\n> " + glossary.split("\n", 1)[1].replace("\n", "\n> ") + "\n\n" + answer
 
         return {
             "answer": stale_note + answer,
@@ -249,10 +305,15 @@ class RAGService:
         model: str,
         question: str,
         context: str,
-        chat_history: Optional[List[Dict[str, str]]] = None
+        chat_history: Optional[List[Dict[str, str]]] = None,
+        url: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        label: str = "OpenRouter",
+        timeout: float = 45.0,
     ) -> str:
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
+        # Mặc định gọi OpenRouter; truyền url/headers/label để gọi provider tùy chỉnh chuẩn OpenAI
+        url = url or "https://openrouter.ai/api/v1/chat/completions"
+        headers = headers or {
             "Authorization": f"Bearer {api_key.strip()}",
             "HTTP-Referer": "http://localhost:8000",
             "X-Title": "Second Brain AI",
@@ -286,7 +347,7 @@ class RAGService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=45.0) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(url, headers=headers, json=payload)
                 if resp.status_code == 200:
                     data = resp.json()
@@ -294,11 +355,11 @@ class RAGService:
                     if choices and "message" in choices[0]:
                         return choices[0]["message"].get("content", "")
                 else:
-                    return f"Lỗi gọi OpenRouter API ({resp.status_code}): {resp.text}"
+                    return f"Lỗi gọi {label} API ({resp.status_code}): {resp.text}"
         except Exception as e:
-            return f"Không thể kết nối đến OpenRouter API: {str(e)}"
+            return f"Không thể kết nối đến {label} API: {str(e)}"
 
-        return "Không nhận được phản hồi từ mô hình OpenRouter."
+        return f"Không nhận được phản hồi từ mô hình {label}."
 
     async def _call_gemini_rag(
         self,

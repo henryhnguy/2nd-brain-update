@@ -1,11 +1,14 @@
 import os
+from typing import List, Optional
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 from brain_app.database import get_db_connection
 from brain_app.models import SettingsUpdate
 from brain_app.rag.embeddings import embedding_service, PROVIDERS, LOCAL_MODELS
 from brain_app.rag.rag_service import rag_service
 from brain_app.rag.vector_store import vector_store
 from brain_app.rag.reindex import reindex_manager
+from brain_app.rag import custom_providers
 from brain_app.rag.model_catalog import (
     GEMINI_FALLBACK, OPENROUTER_FALLBACK, DEFAULT_GEMINI_CHAT_MODEL, list_models,
 )
@@ -73,6 +76,8 @@ def get_settings():
         "openrouter_api_key_configured": bool(or_key and len(or_key) > 5),
         "openrouter_api_key_masked": or_masked,
         "openrouter_model": openrouter_model,
+        "custom_providers": custom_providers.list_providers(),
+        "custom_provider_presets": custom_providers.PRESETS,
         "available_models": {
             "gemini": GEMINI_MODELS,
             "openrouter": POPULAR_OPENROUTER_MODELS
@@ -91,6 +96,14 @@ async def update_settings(data: SettingsUpdate):
         raise HTTPException(status_code=400, detail=f"embedding_provider phải thuộc {list(PROVIDERS)}")
     if data.embedding_local_model is not None and data.embedding_local_model not in {m["id"] for m in LOCAL_MODELS}:
         raise HTTPException(status_code=400, detail="embedding_local_model không được hỗ trợ")
+
+    if data.llm_provider is not None:
+        lp = data.llm_provider.strip().lower()
+        if lp.startswith("custom:"):
+            if not custom_providers.exists(lp):
+                raise HTTPException(status_code=400, detail="Provider tùy chỉnh này không tồn tại (có thể đã bị xoá)")
+        elif lp not in ("gemini", "openrouter"):
+            raise HTTPException(status_code=400, detail="llm_provider phải là 'gemini', 'openrouter' hoặc 'custom:<id>'")
 
     tag_before = embedding_service.active_tag()
     conn = get_db_connection()
@@ -159,3 +172,57 @@ async def embedding_test():
 async def embedding_reindex(all: bool = False):
     started = reindex_manager.start(force_all=all)
     return {"started": started, **embedding_block()}
+
+
+# ------------------------------------------------------------------ Provider AI tùy chỉnh (chuẩn OpenAI)
+
+class CustomProviderIn(BaseModel):
+    id: Optional[str] = None            # có id = cập nhật, không có = tạo mới
+    name: str
+    base_url: str
+    api_key: Optional[str] = None       # None = giữ key cũ; "" = xoá key
+    models: List[str] = Field(default_factory=list)
+    default_model: str = ""
+    json_mode: str = "auto"             # 'auto' | 'off' (một số máy chủ không hỗ trợ response_format)
+
+
+class CustomProviderTest(BaseModel):
+    model: Optional[str] = None
+
+
+def _cp_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except custom_providers.CustomProviderError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+
+@router.get("/custom-providers")
+def list_custom_providers():
+    return {"providers": custom_providers.list_providers(), "presets": custom_providers.PRESETS}
+
+
+@router.post("/custom-providers")
+def save_custom_provider(body: CustomProviderIn):
+    return _cp_call(custom_providers.upsert, body.model_dump())
+
+
+@router.delete("/custom-providers/{provider_id}")
+def delete_custom_provider(provider_id: str):
+    _cp_call(custom_providers.delete, provider_id)
+    conn = get_db_connection()
+    try:  # đang là provider mặc định thì đưa về Gemini để app không bị kẹt
+        conn.execute("UPDATE settings SET value = 'gemini' WHERE key = 'llm_provider' AND value = ?",
+                     (f"custom:{provider_id}",))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"success": True}
+
+
+@router.post("/custom-providers/{provider_id}/test")
+async def test_custom_provider(provider_id: str, body: CustomProviderTest = CustomProviderTest()):
+    try:
+        return await custom_providers.test(provider_id, body.model)
+    except custom_providers.CustomProviderError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
